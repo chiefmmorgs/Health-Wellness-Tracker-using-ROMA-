@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import Any, Dict, List
 from app import run_pipeline
 
-app = FastAPI(title="ROMA Health Tracker API")
+app = FastAPI(title="Health Tracker API")
 
 class Payload(BaseModel):
     user_profile: Dict[str, Any]
