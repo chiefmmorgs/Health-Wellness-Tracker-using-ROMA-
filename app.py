@@ -1,234 +1,171 @@
-from __future__ import annotations
-import json
+# api.py — location-agnostic ROMA integration
 
-def ingest(data):
-    user = data.get("user_profile", {}) or {}
-    logs = data.get("daily_logs", []) or []
-    targets = data.get("targets", {}) or {}
-    missing = []
+from dotenv import load_dotenv
+from pathlib import Path
+import os, sys, importlib, inspect, pkgutil, json, traceback
+from typing import Optional, Dict, Any
 
-    prof = {
-        "age": user.get("age"),
-        "sex": user.get("sex"),
-        "height_cm": user.get("height_cm"),
-        "weight_kg": user.get("weight_kg"),
-        "goal": user.get("goal"),
-        "constraints": user.get("constraints") or None,
-    }
-    for k in ["age","sex","height_cm","weight_kg","goal"]:
-        if prof.get(k) is None:
-            missing.append(f"user_profile.{k}")
+# ---- Load .env from the REPO ROOT (walk up until we see .git or roma-core) ----
+_here = Path(__file__).resolve()
+_root = _here
+for _ in range(6):
+    if (_root / ".git").exists() or (_root / "roma-core").exists():
+        break
+    _root = _root.parent
+load_dotenv(dotenv_path=_root / ".env")
 
-    norm_logs = []
-    for row in logs:
-        if not row.get("date"):
-            missing.append("daily_logs[].date")
-        workouts = []
-        for w in row.get("workouts", []) or []:
-            workouts.append({
-                "type": w.get("type") or "other",
-                "minutes": int(w.get("minutes") or 0),
-                "intensity_1_5": int(w.get("intensity_1_5") or 1),
-            })
-        norm_logs.append({
-            "date": row.get("date"),
-            "sleep_hours": row.get("sleep_hours"),
-            "steps": row.get("steps"),
-            "workouts": workouts,
-            "calories_in": row.get("calories_in"),
-            "water_liters": row.get("water_liters"),
-            "mood_1_5": row.get("mood_1_5"),
-            "notes": (row.get("notes") or "")[:140],
-        })
+# ---- Force OpenRouter; block OpenAI fallback (so missing OPENAI_API_KEY never breaks) ----
+os.environ.pop("OPENAI_API_KEY", None)
+os.environ.setdefault("AGNO_DEFAULT_PROVIDER", "openrouter")
+os.environ.setdefault("AGNO_DEFAULT_MODEL", "openrouter/deepseek/deepseek-chat-v3.1:free")
+if os.getenv("OPENROUTER_API_KEY") and not os.getenv("LITELLM_API_KEY"):
+    os.environ["LITELLM_API_KEY"] = os.environ["OPENROUTER_API_KEY"]
+os.environ.setdefault("LITELLM_API_BASE", "https://openrouter.ai/api/v1")
+os.environ.setdefault("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
-    norm_targets = {
-        "sleep_h": targets.get("sleep_h"),
-        "steps": targets.get("steps"),
-        "workouts_per_week": targets.get("workouts_per_week"),
-        "calories_in": targets.get("calories_in"),
-        "water_liters": targets.get("water_liters"),
-    }
+# ---- Make editable install optional (if not installed, add roma-core/src to sys.path) ----
+roma_src = _root / "roma-core" / "src"
+if roma_src.exists() and str(roma_src) not in sys.path:
+    sys.path.insert(0, str(roma_src))
 
-    ok = len(missing) == 0 and len(norm_logs) > 0
-    return {
-        "ok": ok,
-        "missing_fields": missing if not ok else [],
-        "profile": prof,
-        "logs": norm_logs,
-        "targets": norm_targets,
-    }
+# ---- Import ROMA after env is set/path prepared ----
+import sentientresearchagent as sra  # provided by SentientResearchAgent
 
-def _avg(xs):
-    xs = [x for x in xs if x is not None]
-    return round(sum(xs)/len(xs), 2) if xs else None
+def pick_runner():
+    hits = []
+    for _, modname, _ in pkgutil.walk_packages(sra.__path__, sra.__name__ + "."):
+        if not any(k in modname.lower() for k in ["agent", "runner", "framework"]):
+            continue
+        try:
+            m = importlib.import_module(modname)
+        except Exception:
+            continue
+        for name, obj in vars(m).items():
+            if isinstance(obj, type) and callable(getattr(obj, "run", None)):
+                score = ("runner" in name.lower()) * 2 + ("agent" in name.lower())
+                try:
+                    sig = inspect.signature(obj)
+                    if any(p.name == "config" for p in sig.parameters.values()):
+                        score += 1
+                except Exception:
+                    pass
+                hits.append((score, f"{modname}.{name}", obj))
+    if not hits:
+        raise RuntimeError("No runner with .run(...) found in sentientresearchagent")
+    hits.sort(reverse=True)
+    _, fqname, cls = hits[0]
+    return cls, fqname
 
-def metrics(profile, logs, targets):
-    sleep_avg = _avg([d.get("sleep_hours") for d in logs])
-    steps_avg = _avg([d.get("steps") for d in logs])
-    water_avg = _avg([d.get("water_liters") for d in logs])
-    workouts_count = sum(len(d.get("workouts",[])) for d in logs)
-    minutes_total = sum(sum(w["minutes"] for w in d.get("workouts",[])) for d in logs)
-    cals_avg = _avg([d.get("calories_in") for d in logs])
+RunnerClass, chosen_runner = pick_runner()
 
-    bmi = None
-    try:
-        h = (profile["height_cm"] or 0)/100
-        if h and profile["weight_kg"]:
-            bmi = round(profile["weight_kg"]/(h*h), 2)
-    except:
-        pass
-
-    def tdee():
-        age = profile.get("age")
-        sex = profile.get("sex")
-        w = profile.get("weight_kg")
-        hcm = profile.get("height_cm")
-        if None in (age, sex, w, hcm) or steps_avg is None:
-            return None
-        bmr = 10*w + 6.25*hcm - 5*age + (5 if str(sex).upper().startswith("M") else -161)
-        if steps_avg < 5000:
-            af = 1.2
-        elif steps_avg < 8000:
-            af = 1.35
-        elif steps_avg < 12000:
-            af = 1.5
-        else:
-            af = 1.7
-        return round(bmr*af, 0)
-
-    t = tdee()
-    cal_bal = round(cals_avg - t, 0) if (cals_avg is not None and t is not None) else None
-
-    def adhere(actual, target, higher=True):
-        if actual is None or target is None or target == 0:
-            return None
-        if higher:
-            ratio = min(actual/target, 1.0)
-        else:
-            ratio = min(target/max(actual,1), 1.0) if actual > 0 else 1.0
-        return int(round(ratio*100))
-
-    adherence = {
-        "sleep": adhere(sleep_avg, targets.get("sleep_h"), True),
-        "steps": adhere(steps_avg, targets.get("steps"), True),
-        "workouts": adhere(workouts_count, targets.get("workouts_per_week"), True),
-        "calories_in": adhere(cals_avg, targets.get("calories_in"), False),
-        "water": adhere(water_avg, targets.get("water_liters"), True),
-    }
-
-    return {
-        "bmi": bmi,
-        "sleep_avg_h": sleep_avg,
-        "steps_avg": steps_avg,
-        "water_avg_l": water_avg,
-        "workouts_count": workouts_count,
-        "minutes_total": minutes_total,
-        "calorie_balance_est": cal_bal,
-        "adherence": adherence
-    }
-
-def coach(logs, targets, m):
-    adh = m["adherence"]
-    pairs = [(k, (v if v is not None else -1)) for k, v in adh.items()]
-    pairs.sort(key=lambda x: x[1])
-    weakest = pairs[0][0] if pairs else None
-
-    daily = []
-    for day in logs:
-        tips = []
-        if day.get("sleep_hours") is not None and targets.get("sleep_h") and day["sleep_hours"] < targets["sleep_h"]:
-            tips.append("Go to bed 20 min earlier tonight")
-        if day.get("steps") is not None and targets.get("steps") and day["steps"] < targets["steps"]:
-            tips.append("Add a 10-minute brisk walk")
-        if day.get("water_liters") is not None and targets.get("water_liters") and day["water_liters"] < targets["water_liters"]:
-            tips.append("Drink 1 glass after each bathroom break")
-        if day.get("calories_in") is not None and targets.get("calories_in") and day["calories_in"] > targets["calories_in"]:
-            tips.append("Swap one snack for fruit or yogurt")
-        daily.append({"date": day["date"], "tips": tips[:3]})
-
-    focus = []
-    if weakest == "sleep":
-        focus.append("Sleep: add 15–20 minutes per night")
-    if weakest == "steps":
-        focus.append("Movement: one short walk daily")
-    if weakest == "calories_in":
-        focus.append("Food: one lighter swap per day")
-    if weakest == "water":
-        focus.append("Hydration: 1 extra glass per meal")
-    if weakest == "workouts":
-        focus.append("Training: schedule 1 short session")
-    return {"daily_suggestions": daily, "weekly_focus": focus[:2]}
-
-def report(m, focus):
-    wins, gaps = [], []
-    if m["sleep_avg_h"] is not None:
-        (wins if m["sleep_avg_h"] >= 7 else gaps).append("Sleep avg")
-    if m["steps_avg"] is not None:
-        (wins if m["steps_avg"] >= 8000 else gaps).append("Steps avg")
-
-    kpis = [
-        {"name": "Sleep avg (h)", "value": m["sleep_avg_h"]},
-        {"name": "Steps avg", "value": m["steps_avg"]},
-        {"name": "Workouts", "value": m["workouts_count"]},
+# ---- Resolve agent config robustly (env override + glob) ----
+# Allow override: TRACKER_AGENT_CONFIG=/abs/or/relative/path.yaml
+cfg_override = os.getenv("TRACKER_AGENT_CONFIG")
+if cfg_override:
+    AGENT_CONFIG = str((Path(cfg_override).resolve()))
+else:
+    # Common locations (both from repo root and from src/)
+    candidates = [
+        _root / "src" / "sentientresearchagent" / "hierarchical_agent_framework" / "agent_configs" / "tracker_agent.yaml",
+        _root / "sentientresearchagent" / "hierarchical_agent_framework" / "agent_configs" / "tracker_agent.yaml",
     ]
-    weekly_plan = {
-        "focus": focus,
-        "checkpoints": [
-            {"day": "Mon", "action": "Plan 3 short walks"},
-            {"day": "Thu", "action": "Lights out 20 min earlier"},
-            {"day": "Sat", "action": "1 bodyweight session, 20 min"},
-        ],
-    }
-    pairs = sorted([(k, v if v is not None else -1) for k,v in m["adherence"].items()], key=lambda x: x[1])
-    next_actions = []
-    for k,_ in pairs[:2]:
-        if k == "sleep":
-            next_actions.append("Set a fixed bedtime alarm tonight")
-        elif k == "steps":
-            next_actions.append("Add 10-minute afternoon walk today")
-        elif k == "calories_in":
-            next_actions.append("Swap one snack for fruit today")
-        elif k == "water":
-            next_actions.append("Carry a 500ml bottle all day")
-        elif k == "workouts":
-            next_actions.append("Book one 20-minute session this week")
+    AGENT_CONFIG = None
+    for c in candidates:
+        if c.exists():
+            AGENT_CONFIG = str(c)
+            break
+    if not AGENT_CONFIG:
+        raise FileNotFoundError("tracker_agent.yaml not found. Set TRACKER_AGENT_CONFIG env or create the file under src/.../agent_configs/")
 
+# ---- FastAPI app ----
+from fastapi import FastAPI, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Health Wellness Tracker (ROMA)", version="0.5.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+# Instantiate runner (with config path we resolved)
+try:
+    runner = RunnerClass(config=AGENT_CONFIG)
+except TypeError:
+    runner = RunnerClass()
+
+class HealthEntry(BaseModel):
+    meal_log: Optional[str] = Field(None, example="Rice and beans for lunch")
+    exercise_log: Optional[str] = Field(None, example="20 min walk")
+    sleep_log: Optional[str] = Field(None, example="6h")
+    mood_log: Optional[str] = Field(None, example="Tired")
+    extras: Optional[Dict[str, Any]] = None
+
+class AnalysisOut(BaseModel):
+    analysis: Dict[str, Any]
+
+@app.get("/version")
+def version():
     return {
-        "week_summary": {"wins": wins, "gaps": gaps, "kpis": kpis},
-        "weekly_plan": weekly_plan,
-        "next_actions": next_actions[:2]
+        "cwd": str(Path.cwd()),
+        "here": str(_here),
+        "repo_root": str(_root),
+        "runner": chosen_runner,
+        "agent_config": AGENT_CONFIG,
+        "openrouter_key_set": bool(os.environ.get("OPENROUTER_API_KEY")),
+        "provider": os.getenv("AGNO_DEFAULT_PROVIDER"),
+        "model": os.getenv("AGNO_DEFAULT_MODEL"),
+        "has_openai_key": bool(os.environ.get("OPENAI_API_KEY")),
     }
 
-def run_pipeline(user_input):
-    ing = ingest(user_input)
-    if not ing["ok"]:
-        return {
-            "status": "needs_input",
-            "missing_fields": ing["missing_fields"],
-            "week_summary": {},
-            "daily_suggestions": [],
-            "weekly_plan": {},
-            "next_actions": []
-        }
-    met = metrics(ing["profile"], ing["logs"], ing["targets"])
-    coa = coach(ing["logs"], ing["targets"], met)
-    rep = report(met, coa["weekly_focus"])
-    return {
-        "status": "ok",
-        "missing_fields": [],
-        "week_summary": rep["week_summary"],
-        "daily_suggestions": coa["daily_suggestions"],
-        "weekly_plan": rep["weekly_plan"],
-        "next_actions": rep["next_actions"]
+@app.get("/")
+def health():
+    return {"ok": True}
+
+@app.post("/analyze", response_model=AnalysisOut)
+async def analyze_entry(entry: HealthEntry = Body(...)):
+    data = entry.model_dump(exclude_none=True)
+
+    sys_prompt = (
+        "You are a wellness assistant. Given daily logs, return JSON with keys "
+        '"daily_summary" and "recommendations". Keep it concise and actionable.'
+    )
+    user_lines = [f"{k}: {v}" for k, v in data.items() if k in {"meal_log","exercise_log","sleep_log","mood_log"} and v]
+    user_msg = "\n".join(user_lines) or json.dumps(data, ensure_ascii=False)
+
+    # Try wrapped messages first (many runners expect this)
+    messages_list = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_msg},
+    ]
+    call_hints = {
+        "provider": "openrouter",
+        "model": os.getenv("AGNO_DEFAULT_MODEL", "openrouter/deepseek/deepseek-chat-v3.1:free"),
+        "api_base": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        "api_key": os.getenv("OPENROUTER_API_KEY", ""),
     }
 
-if __name__ == "__main__":
-    example_input = {
-        "user_profile": { "age": 28, "sex": "M", "height_cm": 177, "weight_kg": 79, "goal": "fat loss", "constraints": "knee pain on runs" },
-        "targets": { "sleep_h": 7.5, "steps": 9000, "workouts_per_week": 3, "calories_in": 2400, "water_liters": 2.5 },
-        "daily_logs": [
-            { "date": "2025-09-08", "sleep_hours": 6.8, "steps": 7200, "workouts": [{ "type": "push", "minutes": 35, "intensity_1_5": 3 }], "calories_in": 2550, "water_liters": 2.0, "mood_1_5": 3, "notes": "desk day" },
-            { "date": "2025-09-09", "sleep_hours": 7.1, "steps": 8100, "workouts": [], "calories_in": 2450, "water_liters": 2.3, "mood_1_5": 4, "notes": "light walk" }
-        ]
-    }
-    print(json.dumps(run_pipeline(example_input), indent=2))
+    try:
+        res = runner.run({"messages": messages_list, **call_hints})
+        return {"analysis": res if isinstance(res, dict) else {"model_output": res}}
+    except Exception:
+        try:
+            res = runner.run(messages_list)  # bare list
+            return {"analysis": res if isinstance(res, dict) else {"model_output": res}}
+        except Exception:
+            try:
+                res = runner.run({**data, **call_hints})  # raw dict
+                return {"analysis": res if isinstance(res, dict) else {"model_output": res}}
+            except Exception as e3:
+                tb = traceback.format_exc()
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": str(e3),
+                        "hint": "Tried wrapped messages, bare list, raw dict with OpenRouter hints.",
+                        "agent_config": AGENT_CONFIG,
+                        "trace_tail": tb[-2000:],
+                    },
+                )
