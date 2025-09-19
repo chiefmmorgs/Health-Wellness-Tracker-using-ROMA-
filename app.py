@@ -1,171 +1,230 @@
-# api.py — location-agnostic ROMA integration
-
 from dotenv import load_dotenv
 from pathlib import Path
-import os, sys, importlib, inspect, pkgutil, json, traceback
+import os, sys, json, traceback
 from typing import Optional, Dict, Any
 
-# ---- Load .env from the REPO ROOT (walk up until we see .git or roma-core) ----
+# ---- Load .env from the REPO ROOT ----
 _here = Path(__file__).resolve()
-_root = _here
-for _ in range(6):
-    if (_root / ".git").exists() or (_root / "roma-core").exists():
-        break
-    _root = _root.parent
+_root = _here.parent
 load_dotenv(dotenv_path=_root / ".env")
 
-# ---- Force OpenRouter; block OpenAI fallback (so missing OPENAI_API_KEY never breaks) ----
-os.environ.pop("OPENAI_API_KEY", None)
-os.environ.setdefault("AGNO_DEFAULT_PROVIDER", "openrouter")
-os.environ.setdefault("AGNO_DEFAULT_MODEL", "openrouter/deepseek/deepseek-chat-v3.1:free")
-if os.getenv("OPENROUTER_API_KEY") and not os.getenv("LITELLM_API_KEY"):
-    os.environ["LITELLM_API_KEY"] = os.environ["OPENROUTER_API_KEY"]
-os.environ.setdefault("LITELLM_API_BASE", "https://openrouter.ai/api/v1")
-os.environ.setdefault("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+# ---- CRITICAL: Set up LiteLLM/OpenRouter BEFORE any imports ----
+# This ensures ROMA uses OpenRouter instead of OpenAI
+openrouter_key = os.getenv("OPENROUTER_API_KEY")
+if not openrouter_key:
+    print("WARNING: OPENROUTER_API_KEY not set. Please add it to your .env file")
+    print("Get your free API key at: https://openrouter.ai/keys")
+    sys.exit(1)
 
-# ---- Make editable install optional (if not installed, add roma-core/src to sys.path) ----
-roma_src = _root / "roma-core" / "src"
-if roma_src.exists() and str(roma_src) not in sys.path:
-    sys.path.insert(0, str(roma_src))
+# Set up LiteLLM configuration for OpenRouter
+os.environ["LITELLM_API_KEY"] = openrouter_key
+os.environ["LITELLM_API_BASE"] = "https://openrouter.ai/api/v1"
+os.environ["OPENROUTER_BASE_URL"] = "https://openrouter.ai/api/v1"
 
-# ---- Import ROMA after env is set/path prepared ----
-import sentientresearchagent as sra  # provided by SentientResearchAgent
+# Force OpenRouter as default provider
+os.environ["AGNO_DEFAULT_PROVIDER"] = "openrouter"
+os.environ["AGNO_DEFAULT_MODEL"] = "openrouter/deepseek/deepseek-chat"
 
-def pick_runner():
-    hits = []
-    for _, modname, _ in pkgutil.walk_packages(sra.__path__, sra.__name__ + "."):
-        if not any(k in modname.lower() for k in ["agent", "runner", "framework"]):
-            continue
-        try:
-            m = importlib.import_module(modname)
-        except Exception:
-            continue
-        for name, obj in vars(m).items():
-            if isinstance(obj, type) and callable(getattr(obj, "run", None)):
-                score = ("runner" in name.lower()) * 2 + ("agent" in name.lower())
-                try:
-                    sig = inspect.signature(obj)
-                    if any(p.name == "config" for p in sig.parameters.values()):
-                        score += 1
-                except Exception:
-                    pass
-                hits.append((score, f"{modname}.{name}", obj))
-    if not hits:
-        raise RuntimeError("No runner with .run(...) found in sentientresearchagent")
-    hits.sort(reverse=True)
-    _, fqname, cls = hits[0]
-    return cls, fqname
+# IMPORTANT: Set a dummy OpenAI key to prevent errors
+os.environ["OPENAI_API_KEY"] = "sk-dummy-key-for-openrouter"
 
-RunnerClass, chosen_runner = pick_runner()
-
-# ---- Resolve agent config robustly (env override + glob) ----
-# Allow override: TRACKER_AGENT_CONFIG=/abs/or/relative/path.yaml
-cfg_override = os.getenv("TRACKER_AGENT_CONFIG")
-if cfg_override:
-    AGENT_CONFIG = str((Path(cfg_override).resolve()))
-else:
-    # Common locations (both from repo root and from src/)
-    candidates = [
-        _root / "src" / "sentientresearchagent" / "hierarchical_agent_framework" / "agent_configs" / "tracker_agent.yaml",
-        _root / "sentientresearchagent" / "hierarchical_agent_framework" / "agent_configs" / "tracker_agent.yaml",
-    ]
-    AGENT_CONFIG = None
-    for c in candidates:
-        if c.exists():
-            AGENT_CONFIG = str(c)
-            break
-    if not AGENT_CONFIG:
-        raise FileNotFoundError("tracker_agent.yaml not found. Set TRACKER_AGENT_CONFIG env or create the file under src/.../agent_configs/")
-
-# ---- FastAPI app ----
+# ---- FastAPI app with simple local agents ----
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Health Wellness Tracker (ROMA)", version="0.5.0")
+# Import your local health runner
+from roma_engine.runner import HealthRunner
+
+app = FastAPI(title="Health Wellness Tracker", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"], 
+    allow_headers=["*"],
 )
 
-# Instantiate runner (with config path we resolved)
-try:
-    runner = RunnerClass(config=AGENT_CONFIG)
-except TypeError:
-    runner = RunnerClass()
+# Use your local HealthRunner instead of ROMA's runner
+runner = HealthRunner()
 
 class HealthEntry(BaseModel):
     meal_log: Optional[str] = Field(None, example="Rice and beans for lunch")
     exercise_log: Optional[str] = Field(None, example="20 min walk")
     sleep_log: Optional[str] = Field(None, example="6h")
     mood_log: Optional[str] = Field(None, example="Tired")
+    water_intake_l: Optional[float] = Field(None, example=2.5)
     extras: Optional[Dict[str, Any]] = None
 
 class AnalysisOut(BaseModel):
     analysis: Dict[str, Any]
 
+@app.get("/")
+def health():
+    return {
+        "status": "ok",
+        "endpoints": {
+            "/": "Health check",
+            "/version": "System info",
+            "/analyze": "Analyze health entry (POST)",
+            "/weekly-report": "Generate weekly report (POST)",
+            "/example": "Get example payload"
+        }
+    }
+
 @app.get("/version")
 def version():
     return {
         "cwd": str(Path.cwd()),
-        "here": str(_here),
         "repo_root": str(_root),
-        "runner": chosen_runner,
-        "agent_config": AGENT_CONFIG,
         "openrouter_key_set": bool(os.environ.get("OPENROUTER_API_KEY")),
         "provider": os.getenv("AGNO_DEFAULT_PROVIDER"),
         "model": os.getenv("AGNO_DEFAULT_MODEL"),
-        "has_openai_key": bool(os.environ.get("OPENAI_API_KEY")),
+        "dummy_openai_key_set": bool(os.environ.get("OPENAI_API_KEY")),
     }
 
-@app.get("/")
-def health():
-    return {"ok": True}
+@app.get("/example")
+def example():
+    """Ready-to-use example payload for /weekly-report"""
+    return {
+        "user_profile": {
+            "age": 28,
+            "sex": "M",
+            "height_cm": 177,
+            "weight_kg": 79,
+            "goal": "fat loss",
+            "constraints": "knee pain on runs",
+        },
+        "targets": {
+            "sleep_h": 7.5,
+            "steps": 9000,
+            "workouts_per_week": 3,
+            "calories_in": 2400,
+            "water_liters": 2.5,
+        },
+        "daily_logs": [
+            {
+                "date": "2025-09-15",
+                "sleep_hours": 6.8,
+                "steps": 7200,
+                "workouts": [{"type": "push", "minutes": 35, "intensity_1_5": 3}],
+                "calories_in": 2550,
+                "water_liters": 2.0,
+                "mood_1_5": 3,
+                "notes": "desk day",
+            },
+            {
+                "date": "2025-09-16",
+                "sleep_hours": 7.1,
+                "steps": 8100,
+                "workouts": [],
+                "calories_in": 2450,
+                "water_liters": 2.3,
+                "mood_1_5": 4,
+                "notes": "light walk",
+            },
+            {
+                "date": "2025-09-17",
+                "sleep_hours": 7.8,
+                "steps": 9500,
+                "workouts": [{"type": "cardio", "minutes": 25, "intensity_1_5": 4}],
+                "calories_in": 2300,
+                "water_liters": 2.8,
+                "mood_1_5": 5,
+                "notes": "great day",
+            }
+        ],
+    }
+
+@app.post("/weekly-report")
+async def weekly_report(payload: Dict[str, Any] = Body(...)):
+    """Generate weekly health report using local agents"""
+    try:
+        # Use your local HealthRunner
+        result = runner.run(payload)
+        return result
+    except Exception as e:
+        tb = traceback.format_exc()
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(e),
+                "trace_tail": tb[-1000:],
+            },
+        )
 
 @app.post("/analyze", response_model=AnalysisOut)
 async def analyze_entry(entry: HealthEntry = Body(...)):
+    """Simple analysis of a single health entry"""
     data = entry.model_dump(exclude_none=True)
-
-    sys_prompt = (
-        "You are a wellness assistant. Given daily logs, return JSON with keys "
-        '"daily_summary" and "recommendations". Keep it concise and actionable.'
-    )
-    user_lines = [f"{k}: {v}" for k, v in data.items() if k in {"meal_log","exercise_log","sleep_log","mood_log"} and v]
-    user_msg = "\n".join(user_lines) or json.dumps(data, ensure_ascii=False)
-
-    # Try wrapped messages first (many runners expect this)
-    messages_list = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_msg},
-    ]
-    call_hints = {
-        "provider": "openrouter",
-        "model": os.getenv("AGNO_DEFAULT_MODEL", "openrouter/deepseek/deepseek-chat-v3.1:free"),
-        "api_base": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-        "api_key": os.getenv("OPENROUTER_API_KEY", ""),
+    
+    # Convert single entry to weekly format for the runner
+    daily_log = {
+        "date": "2025-09-19",
+        "sleep_hours": None,
+        "steps": None,
+        "workouts": [],
+        "calories_in": None,
+        "water_liters": entry.water_intake_l,
+        "mood_1_5": None,
+        "notes": ""
     }
-
-    try:
-        res = runner.run({"messages": messages_list, **call_hints})
-        return {"analysis": res if isinstance(res, dict) else {"model_output": res}}
-    except Exception:
+    
+    # Parse the logs
+    if entry.sleep_log:
         try:
-            res = runner.run(messages_list)  # bare list
-            return {"analysis": res if isinstance(res, dict) else {"model_output": res}}
-        except Exception:
-            try:
-                res = runner.run({**data, **call_hints})  # raw dict
-                return {"analysis": res if isinstance(res, dict) else {"model_output": res}}
-            except Exception as e3:
-                tb = traceback.format_exc()
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "error": str(e3),
-                        "hint": "Tried wrapped messages, bare list, raw dict with OpenRouter hints.",
-                        "agent_config": AGENT_CONFIG,
-                        "trace_tail": tb[-2000:],
-                    },
-                )
+            hours = float(entry.sleep_log.replace('h', '').strip())
+            daily_log["sleep_hours"] = hours
+        except:
+            pass
+    
+    if entry.exercise_log:
+        daily_log["workouts"] = [{"type": "general", "minutes": 20, "intensity_1_5": 3}]
+    
+    if entry.mood_log:
+        mood_map = {"tired": 2, "ok": 3, "good": 4, "great": 5}
+        daily_log["mood_1_5"] = mood_map.get(entry.mood_log.lower(), 3)
+        daily_log["notes"] = entry.mood_log
+    
+    # Create a minimal payload for the runner
+    payload = {
+        "user_profile": {
+            "age": 30,  # Default values
+            "sex": "U",
+            "height_cm": 170,
+            "weight_kg": 70,
+            "goal": "maintain",
+        },
+        "targets": {
+            "sleep_h": 8,
+            "steps": 8000,
+            "workouts_per_week": 3,
+            "calories_in": 2000,
+            "water_liters": 2.5,
+        },
+        "daily_logs": [daily_log]
+    }
+    
+    try:
+        result = runner.run(payload)
+        
+        # Create a simplified analysis
+        analysis = {
+            "daily_summary": {
+                "logged_items": list(data.keys()),
+                "sleep": f"{daily_log['sleep_hours']}h" if daily_log['sleep_hours'] else "not logged",
+                "activity": "logged" if daily_log['workouts'] else "not logged",
+                "hydration": f"{daily_log['water_liters']}L" if daily_log['water_liters'] else "not logged",
+            },
+            "recommendations": result.get("next_actions", ["Log more data for better insights"]),
+            "status": result.get("status", "ok")
+        }
+        
+        return {"analysis": analysis}
+    except Exception as e:
+        return {"analysis": {"error": str(e), "status": "error"}}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
